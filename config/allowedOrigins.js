@@ -1,7 +1,8 @@
 const allowedOrigins = [
-    'https://ud.ambro.dev',
-    'http://ud.ambro.dev',
-    'https://admin.socket.io/'
+  "https://ud.mans.org.pl",
+  "http://ud.mans.org.pl",
+  "http://localhost:3000",
+  "http://localhost",
 ];
 
 module.exports = allowedOrigins;
