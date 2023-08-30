@@ -12,27 +12,28 @@ const cookieParser = require("cookie-parser");
 const credentials = require("./middleware/credentials");
 const mongoose = require("mongoose");
 const connectDB = require("./config/dbConn");
-const User = require("./model/User");
 const Conversation = require("./model/Conversation");
-const { createEvent } = require("./controllers/eventsController");
 const http = require("http").createServer(app);
 const imageRoutes = require("./controllers/pictureController");
 const filesRoutes = require("./controllers/filesController");
+const Course = require("./model/Course");
+const User = require("./model/User");
+const bcrypt = require("bcrypt");
+const readline = require("readline");
 const io = require("socket.io")(http, {
   cors: {
-    origin: ["https://ud.ambro.dev", "https://admin.socket.io"],
+    origin: [
+      "http://localhost:3000",
+      "https://future.mans.org.pl",
+      "https://www.future.mans.org.pl",
+      "http://localhost",
+    ],
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
-const crypto = require("crypto");
-const { GridFsStorage } = require("multer-gridfs-storage");
-const Grid = require("gridfs-stream");
-const methodOverride = require("method-override");
-const multer = require("multer");
 
 const PORT = process.env.PORT || 3500;
-const socketIOPort = process.env.SOCKETIO_PORT || 4000;
 
 // Connect to MongoDB
 connectDB();
@@ -57,22 +58,24 @@ app.use(express.json());
 app.use(cookieParser());
 
 //serve static files
-app.use("/", express.static(path.join(__dirname, "/public")));
+app.use("/api/", express.static(path.join(__dirname, "/public")));
 
 // routes
-app.use("/", require("./routes/root"));
-app.use("/register", require("./routes/register"));
-app.use("/auth", require("./routes/auth"));
-app.use("/refresh", require("./routes/refresh"));
-app.use("/logout", require("./routes/logout"));
+app.use("/api/", require("./routes/root"));
+app.use("/api/register", require("./routes/register"));
+app.use("/api/auth", require("./routes/auth"));
+app.use("/api/refresh", require("./routes/refresh"));
+app.use("/api/logout", require("./routes/logout"));
+app.use("/api/reset-password", require("./routes/reset-password"));
 
 app.use(verifyJWT);
-app.use("/users", require("./routes/api/users"));
-app.use("/courses", require("./routes/api/courses"));
-app.use("/conversations", require("./routes/api/conversations"));
-app.use("/events", require("./routes/api/events"));
-app.use("/profile-picture", imageRoutes);
-app.use("/files", filesRoutes);
+app.use("/api/users", require("./routes/api/users"));
+app.use("/api/courses", require("./routes/api/courses"));
+app.use("/api/conversations", require("./routes/api/conversations"));
+app.use("/api/events", require("./routes/api/events"));
+app.use("/api/profile-picture", imageRoutes);
+app.use("/api/files", filesRoutes);
+app.use("/api/admin", require("./routes/api/admin"));
 
 app.all("*", (req, res) => {
   res.status(404);
@@ -88,45 +91,136 @@ app.use(errorHandler);
 
 const connection = mongoose.connection;
 
-connection.once("open", () => {
-  console.log("Connected to MongoDB");
-  http.listen(PORT, () => {
-    console.log(`HTTP server listening on port ${PORT}`);
-  });
-  const gfs = Grid(connection.db, mongoose.mongo);
-  gfs.collection = "uploads";
-  module.exports.gfs = gfs;
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
 });
 
-const users = {};
+connection.once("open", async () => {
+  console.log("Connected to MongoDB");
+
+  const admin = await User.findOne({ email: "admin@mans.org.pl" }).exec();
+
+  if (!admin) {
+    let password = "";
+
+    while (password.length < 16 || !isStrongPassword(password)) {
+      password = await new Promise((resolve) => {
+        rl.question(
+          "Enter admin password (min length 16 characters, at least one uppercase, one lowercase, one digit, and one special character): ",
+          (answer) => {
+            resolve(answer);
+          }
+        );
+      });
+
+      if (password.length < 16) {
+        console.log(
+          "Password too short. Please enter a password with at least 16 characters."
+        );
+      } else if (!isStrongPassword(password)) {
+        console.log(
+          "Password does not meet complexity requirements. Please include at least one uppercase letter, one lowercase letter, one digit, and one special character."
+        );
+      }
+    }
+
+    const hashedPwd = await bcrypt.hash(password, 10);
+
+    const adminUser = await User.create({
+      email: "admin@mans.org.pl",
+      password: hashedPwd,
+      name: "Admin",
+      surname: "Admin",
+      roles: { Admin: 1001 },
+    });
+
+    await adminUser.save();
+
+    console.log("Admin user created");
+
+    http.listen(PORT, () => {
+      console.log(`HTTP server listening on port ${PORT}`);
+    });
+  } else {
+    http.listen(PORT, () => {
+      console.log(`HTTP server listening on port ${PORT}`);
+    });
+  }
+
+  rl.close(); // Close the readline interface
+});
+
+function isStrongPassword(password) {
+  const passwordRegex =
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!#%*?&])[A-Za-z\d@$#!%*?&]+$/;
+  return passwordRegex.test(password);
+}
 
 io.on("connection", (socket) => {
   console.log("A user connected", socket.id);
 
-  socket.on("register", (userId) => {
-    users[userId] = socket.id;
+  socket.on("join-call", async (data) => {
+    const { eventId, userId } = data;
+    console.log("User:", userId, "joins event:", eventId);
 
-    for (const otherUserId in users) {
-      if (otherUserId !== userId) {
-        io.to(socket.id).emit("otherUserRegistered", otherUserId);
-      }
-    }
+    const course = await Course.findOne({
+      "events._id": eventId,
+    }).exec();
 
-    for (const otherUserId in users) {
-      if (otherUserId !== userId) {
-        io.to(users[otherUserId]).emit("otherUserRegistered", userId);
+    if (course) {
+      const event = course.events.id(eventId);
+      if (event) {
+        event.inCall.push(userId);
+        await course.save();
       }
     }
   });
 
+  socket.on("leave-call", async (data) => {
+    const { eventId, userId } = data;
+    console.log("User:", userId, "leaves event:", eventId);
+
+    const course = await Course.findOne({
+      "events._id": eventId,
+    }).exec();
+
+    if (course) {
+      const event = course.events.id(eventId);
+      if (event) {
+        event.inCall = event.inCall.filter((id) => id.toString() !== userId);
+        await course.save();
+      }
+    }
+  });
+
+  socket.on("leave-all", async (data) => {
+    const { userId } = data;
+    console.log("User:", userId, "leaves all calls");
+    await Course.updateMany(
+      { "events.inCall": userId },
+      { $pull: { "events.$.inCall": userId } }
+    );
+  });
+
+  socket.on("user-connected", async (userId) => {
+    const user = await User.findById(userId).exec();
+
+    user.socket = socket.id;
+
+    await user.save();
+  });
+
   socket.on("join-conversation", async (conversationId) => {
     // Join the user to the conversation\
-    socket.join(conversationId);
-    console.log(`User joined conversation ${conversationId}`);
+    if (conversationId) {
+      socket.join(conversationId);
+      console.log(`User joined conversation ${conversationId}`);
 
-    const conversation = await Conversation.findById(conversationId);
-    const messages = conversation.messages;
-    io.to(conversationId).emit("conversation-messages", messages);
+      const conversation = await Conversation.findById(conversationId);
+      const messages = conversation.messages;
+      io.to(conversationId).emit("conversation-messages", messages);
+    }
   });
 
   socket.on("leave-conversation", ({ conversation }) => {
@@ -163,7 +257,20 @@ io.on("connection", (socket) => {
     console.log("User left course:", course);
   });
 
-  socket.on("disconnect", () => {
+  socket.on("disconnect", async (socket) => {
+    const user = await User.findOne({ socket: socket.id }).exec();
+
+    if (user) {
+      await Course.updateMany(
+        { "events.inCall": user._id },
+        { $pull: { "events.$.inCall": user._id } }
+      );
+
+      user.socket = null;
+
+      await user.save();
+    }
+
     console.log("A user disconnected");
   });
 });
